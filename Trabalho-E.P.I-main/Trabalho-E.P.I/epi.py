@@ -1,208 +1,198 @@
 import cv2
+import numpy as np
 from ultralytics import YOLO
+import time
+import winsound  # Apenas para Windows
+import threading 
 
-# Carrega o modelo YOLO-World para detecção personalizada
+# --- CONFIGURAÇÃO INICIAL ---
+print("Carregando modelo YOLO...")
 model = YOLO("yolov8s-worldv2.pt")
 
-# Classes que queremos detectar (ordem importa para os IDs!)
-custom_classes = [
-    "helmet", 
-    "person", 
-    "glasses",      # Óculos de proteção
-    "ear protection",      # Protetor auricular
-    "earmuffs"           # Protetor auricular (alternativo)
-]
-model.set_classes(custom_classes)
+# Vocabulário expandido (melhora detecção)
+model.set_classes([
+    "hard hat", "helmet", "safety helmet",  # IDs 0, 1, 2
+    "person",                               # ID 3
+    "glasses", "eye protection", "goggles"  # IDs 4, 5, 6
+])
 
-# IDs das classes (seguem a ordem da lista acima)
-HELMET_ID = 0
-PERSON_ID = 1
-SAFETY_GOGGLES_ID = 2
-EAR_PROTECTION_ID = 3
-EARMUFFS_ID = 4
+HELMET_IDS = [0, 1, 2]
+PERSON_ID = 3
+GLASSES_IDS = [4, 5, 6]
 
-# Cores
-COLOR_SAFE = (0, 255, 0)        # Verde - Com todos os EPIs
-COLOR_PARTIAL = (0, 255, 255)   # Amarelo - Com alguns EPIs
-COLOR_UNSAFE = (0, 0, 255)      # Vermelho - Sem EPIs
-COLOR_HELMET = (0, 255, 255)    # Amarelo - Capacete
-COLOR_GOGGLES = (255, 0, 255)   # Magenta - Óculos
-COLOR_EAR = (255, 100, 255)     # Rosa - Protetor auricular
+# --- CONFIGURAÇÃO DE SOM ---
+ultimo_aviso = 0
+INTERVALO_AVISO = 2  
 
-def check_ppe_on_person(person_box, ppe_boxes):
-    """
-    Verifica se há um EPI próximo à região da cabeça da pessoa.
-    A cabeça é considerada como 40% superior da caixa da pessoa.
-    """
-    px1, py1, px2, py2 = person_box
-    
-    # Região da cabeça (40% superior da pessoa)
-    head_y1 = py1
-    head_y2 = py1 + (py2 - py1) * 0.4
-    head_x1 = px1
-    head_x2 = px2
-    
-    # Verifica se algum EPI está na região da cabeça
-    for ex1, ey1, ex2, ey2 in ppe_boxes:
-        # Calcula o centro do EPI
-        ppe_center_x = (ex1 + ex2) / 2
-        ppe_center_y = (ey1 + ey2) / 2
-        
-        # Verifica se o centro do EPI está na região da cabeça..
-        if (head_x1 <= ppe_center_x <= head_x2 and 
-            head_y1 <= ppe_center_y <= head_y2):
-            return True
-    
-    return False
+def tocar_alarme():
+    def _beep():
+        try:
+            winsound.Beep(1000, 500)
+        except:
+            pass 
+    t = threading.Thread(target=_beep)
+    t.start()
 
+# --- FUNÇÕES DE DETECÇÃO DE COR (Mantidas) ---
+def verificar_amarelo_haste(img_crop):
+    if img_crop is None or img_crop.size == 0: return False, None
+    hsv = cv2.cvtColor(img_crop, cv2.COLOR_BGR2HSV)
+    lower = np.array([15, 70, 70]) 
+    upper = np.array([45, 255, 255])
+    mask = cv2.inRange(hsv, lower, upper)
+    kernel = np.ones((5,5), np.uint8)
+    mask_dilated = cv2.dilate(mask, kernel, iterations=2)
+    contours, _ = cv2.findContours(mask_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    match_found = False
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest_contour) > (img_crop.shape[0]*img_crop.shape[1] * 0.005): 
+            match_found = True
+    return match_found, mask_dilated
 
+def verificar_vermelho_centro(img_crop):
+    if img_crop is None or img_crop.size == 0: return False, None
+    hsv = cv2.cvtColor(img_crop, cv2.COLOR_BGR2HSV)
+    lower1, upper1 = np.array([0, 140, 80]), np.array([10, 255, 255])
+    lower2, upper2 = np.array([170, 140, 80]), np.array([180, 255, 255])
+    mask = cv2.inRange(hsv, lower1, upper1) + cv2.inRange(hsv, lower2, upper2)
+    kernel = np.ones((3,3), np.uint8)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    if (cv2.countNonZero(mask) / (img_crop.shape[0]*img_crop.shape[1])) > 0.025: 
+        return True, mask
+    return False, mask
+
+# --- LOOP PRINCIPAL ---
 cap = cv2.VideoCapture(0)
 cap.set(3, 1280)
 cap.set(4, 720)
 
-print("=" * 70)
-print("SISTEMA DE MONITORAMENTO DE EPI - VERSÃO COMPLETA")
-print("=" * 70)
-print("EPIs Monitorados:")
-print("  🪖 Capacete")
-print("  🥽 Óculos de Proteção")
-print("  🎧 Protetor Auricular")
-print("  🦺 Colete Refletivo")
-print("\nStatus de Conformidade:")
-print("  ✓ Verde   = Todos os EPIs detectados (SEGURO)")
-print("  ⚠ Amarelo = Alguns EPIs faltando (ATENÇÃO)")
-print("  ✗ Vermelho = EPIs críticos faltando (PERIGO)")
-print("\nPressione 'q' para sair.")
-print("=" * 70)
+print("Sistema Iniciado: MODO FOCO (Fundo Desfocado).")
 
 while True:
-    success, img = cap.read()
-    if not success:
-        break
+    success, img_original = cap.read() # Lemos como img_original
+    if not success: break
 
-    # Realiza a detecção
-    results = model.predict(img, conf=0.10, verbose=False)
+    # Cria uma cópia para ser a imagem final exibida
+    img_display = img_original.copy()
 
-    # Separa as detecções por tipo
+    results = model.predict(img_original, conf=0.3, imgsz=640, verbose=False)
+
     persons = []
     helmets = []
-    goggles = []
-    ear_protections = []
+    epis_olhos_validos = [] 
     
+    # 1. COLETA DE DADOS
     for r in results:
-        boxes = r.boxes
-        for box in boxes:
-            cls_id = int(box.cls[0])
+        for box in r.boxes:
+            cls = int(box.cls[0])
+            coords = list(map(int, box.xyxy[0]))
+            x1, y1, x2, y2 = coords
             conf = float(box.conf[0])
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
             
-            if cls_id == PERSON_ID:
-                persons.append((x1, y1, x2, y2, conf))
-            elif cls_id == HELMET_ID:
-                helmets.append((x1, y1, x2, y2, conf))
-            elif cls_id == SAFETY_GOGGLES_ID:
-                goggles.append((x1, y1, x2, y2, conf))
-            elif cls_id == EAR_PROTECTION_ID or cls_id == EARMUFFS_ID:
-                ear_protections.append((x1, y1, x2, y2, conf))
-    
-    # Desenha os EPIs detectados
-    for hx1, hy1, hx2, hy2, conf in helmets:
-        cv2.rectangle(img, (hx1, hy1), (hx2, hy2), COLOR_HELMET, 2)
-        cv2.putText(img, f'Capacete {conf:.2f}', (hx1, hy1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_HELMET, 2)
-    
-    for gx1, gy1, gx2, gy2, conf in goggles:
-        cv2.rectangle(img, (gx1, gy1), (gx2, gy2), COLOR_GOGGLES, 2)
-        cv2.putText(img, f'Oculos {conf:.2f}', (gx1, gy1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_GOGGLES, 2)
-    
-    for ex1, ey1, ex2, ey2, conf in ear_protections:
-        cv2.rectangle(img, (ex1, ey1), (ex2, ey2), COLOR_EAR, 2)
-        cv2.putText(img, f'Prot.Auricular {conf:.2f}', (ex1, ey1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_EAR, 2)
-    
-    # Analisa cada pessoa detectada
-    helmet_boxes = [(x1, y1, x2, y2) for x1, y1, x2, y2, _ in helmets]
-    goggles_boxes = [(x1, y1, x2, y2) for x1, y1, x2, y2, _ in goggles]
-    ear_boxes = [(x1, y1, x2, y2) for x1, y1, x2, y2, _ in ear_protections]
-    
-    for px1, py1, px2, py2, conf in persons:
-        # Verifica cada EPI
-        has_helmet = check_ppe_on_person((px1, py1, px2, py2), helmet_boxes)
-        has_goggles = check_ppe_on_person((px1, py1, px2, py2), goggles_boxes)
-        has_ear_protection = check_ppe_on_person((px1, py1, px2, py2), ear_boxes)
-        
-        # Conta quantos EPIs a pessoa está usando
-        ppe_count = sum([has_helmet, has_goggles, has_ear_protection])
-        
-        # Define status e cor
-        status_lines = []
-        if has_helmet:
-            status_lines.append("✓ Capacete")
-        else:
-            status_lines.append("✗ Capacete")
+            if cls == PERSON_ID:
+                persons.append(coords)
             
-        if has_goggles:
-            status_lines.append("✓ Oculos")
-        else:
-            status_lines.append("✗ Oculos")
+            elif cls in HELMET_IDS:
+                helmets.append(coords)
             
-        if has_ear_protection:
-            status_lines.append("✓ Prot.Auric")
-        else:
-            status_lines.append("✗ Prot.Auric")
-        
-        # Define cor baseada na conformidade
-        if ppe_count == 3:
-            color = COLOR_SAFE
-            main_status = "SEGURO"
-        elif ppe_count >= 1:
-            color = COLOR_PARTIAL
-            main_status = "ATENCAO"
-        else:
-            color = COLOR_UNSAFE
-            main_status = "PERIGO"
-        
-        # Desenha retângulo ao redor da pessoa
-        cv2.rectangle(img, (px1, py1), (px2, py2), color, 4)
-        
-        # Desenha painel de status
-        panel_y = py1 - 100
-        if panel_y < 0:
-            panel_y = py2 + 10
-        
-        # Fundo do painel
-        cv2.rectangle(img, (px1, panel_y), (px1 + 200, panel_y + 90), (0, 0, 0), -1)
-        cv2.rectangle(img, (px1, panel_y), (px1 + 200, panel_y + 90), color, 2)
-        
-        # Texto do status
-        cv2.putText(img, f"Status: {main_status}", (px1 + 5, panel_y + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
-        y_offset = 40
-        for status_line in status_lines:
-            text_color = COLOR_SAFE if "✓" in status_line else COLOR_UNSAFE
-            cv2.putText(img, status_line, (px1 + 5, panel_y + y_offset),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_color, 1)
-            y_offset += 18
-    
-    # Adiciona contador no canto superior
-    info_bg_height = 80
-    cv2.rectangle(img, (0, 0), (400, info_bg_height), (0, 0, 0), -1)
-    
-    cv2.putText(img, f'Pessoas: {len(persons)}', (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    cv2.putText(img, f'Capacetes: {len(helmets)} | Oculos: {len(goggles)}', (10, 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    cv2.putText(img, f'Prot.Auricular: {len(ear_protections)}', (10, 75),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            elif cls in GLASSES_IDS:
+                # Validação de óculos
+                y1_c, y2_c = max(0, y1), min(img_original.shape[0], y2)
+                x1_c, x2_c = max(0, x1), min(img_original.shape[1], x2)
+                glasses_crop = img_original[y1_c:y2_c, x1_c:x2_c]
+                
+                tem_haste, _ = verificar_amarelo_haste(glasses_crop)
+                tem_centro, _ = verificar_vermelho_centro(glasses_crop)
+                
+                if (tem_haste or tem_centro) or (conf > 0.60):
+                    epis_olhos_validos.append(coords)
 
-    cv2.imshow("Sistema de Monitoramento EPI", img)
+    # 2. LÓGICA DE FOCO E DESFOQUE
+    main_person = None
+    
+    if persons:
+        # Encontra a pessoa mais próxima (Maior área: largura * altura)
+        main_person = max(persons, key=lambda p: (p[2]-p[0]) * (p[3]-p[1]))
+        
+        # PASSO A: Borrar toda a imagem de fundo
+        # (21, 21) é a intensidade do desfoque. Deve ser número ímpar.
+        img_blurred = cv2.GaussianBlur(img_original, (21, 21), 0)
+        
+        # PASSO B: Recortar a pessoa nítida da original e colar no fundo borrado
+        px1, py1, px2, py2 = main_person
+        
+        # Ajuste de segurança para não sair da tela
+        py1, py2 = max(0, py1), min(img_display.shape[0], py2)
+        px1, px2 = max(0, px1), min(img_display.shape[1], px2)
+
+        # A imagem exibida vira a borrada
+        img_display = img_blurred
+        
+        # "Colamos" a pessoa nítida de volta
+        img_display[py1:py2, px1:px2] = img_original[py1:py2, px1:px2]
+
+    else:
+        # Se não tem ninguém, mostra tudo borrado ou tudo normal (escolhi tudo borrado)
+        img_display = cv2.GaussianBlur(img_original, (21, 21), 0)
+
+    # 3. VALIDAÇÃO E DESENHO (Apenas na Pessoa Principal)
+    alguma_infracao = False
+
+    if main_person:
+        px1, py1, px2, py2 = main_person
+        altura_pessoa = py2 - py1
+        
+        # Verifica Capacete
+        zona_capacete_topo = py1 - (altura_pessoa * 0.20)
+        zona_capacete_base = py1 + (altura_pessoa * 0.40)
+        tem_capacete = False
+        
+        for hx1, hy1, hx2, hy2 in helmets:
+            hcx, hcy = (hx1+hx2)/2, (hy1+hy2)/2
+            # Desenha capacete se estiver perto da pessoa principal
+            if (px1 - 50) <= hcx <= (px2 + 50):
+                cv2.rectangle(img_display, (hx1, hy1), (hx2, hy2), (0, 165, 255), 2)
+                if zona_capacete_topo <= hcy <= zona_capacete_base:
+                    tem_capacete = True
+
+        # Verifica Óculos
+        tem_epi_olho = False
+        for ex1, ey1, ex2, ey2 in epis_olhos_validos:
+            ecx, ecy = (ex1+ex2)/2, (ey1+ey2)/2
+            if px1 <= ecx <= px2 and py1 <= ecy <= (py1 + altura_pessoa * 0.6):
+                tem_epi_olho = True
+                cv2.rectangle(img_display, (ex1, ey1), (ex2, ey2), (0, 255, 0), 2)
+                break
+
+        # Status Final
+        if tem_capacete and tem_epi_olho:
+            status = "ACESSO LIBERADO"
+            cor = (0, 255, 0)
+        else:
+            alguma_infracao = True
+            cor = (0, 0, 255)
+            if not tem_capacete and not tem_epi_olho: status = "SEM EPIS"
+            elif not tem_capacete: 
+                status = "SEM CAPACETE"
+                cor = (0, 165, 255)
+            elif not tem_epi_olho: status = "SEM OCULOS"
+        
+        # Desenha a caixa apenas na pessoa focada
+        cv2.rectangle(img_display, (px1, py1), (px2, py2), cor, 3)
+        cv2.putText(img_display, status, (px1, py1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, cor, 3)
+
+    # --- ALARME ---
+    if alguma_infracao:
+        agora = time.time()
+        if agora - ultimo_aviso > INTERVALO_AVISO:
+            tocar_alarme()
+            ultimo_aviso = agora
+
+    cv2.imshow("Detector EPI - Efeito Foco", img_display)
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
 cap.release()
 cv2.destroyAllWindows()
-print("\nSistema encerrado.")
-# postei no github
